@@ -25,6 +25,13 @@ use crate::status::RpcResult;
 
 const DAY_MS: i64 = 86_400_000;
 
+/// Names nobody may give an organisation on a multi-tenant server: they would read as part of the
+/// service (in URLs, mail and the console).
+const RESERVED: &[&str] = &[
+    "admin", "api", "login", "settings", "new", "explore", "www", "mail", "support", "help", "security", "status",
+    "docs", "pando",
+];
+
 #[derive(Clone)]
 pub struct Platform {
     hosting: Arc<Hosting>,
@@ -209,6 +216,58 @@ impl Platform {
         Ok((hook, rec.key))
     }
 
+    /// Records an account for a login being given access. On a multi-tenant server a person
+    /// must have signed in already: a login is not theirs until they have proved it.
+    fn existing_account(&self, login: &str) -> Result<(), Status> {
+        if self.hosting.access.multi_tenant
+            && kind_of(login) == AccountKind::Person
+            && self.reg().account(login).map_err(internal)?.is_none()
+        {
+            return Err(Status::failed_precondition(format!(
+                "{login} has no Pando account yet; ask them to sign in first, or send an invitation"
+            )));
+        }
+        self.reg().ensure_account(login, "").map_err(internal)?;
+        Ok(())
+    }
+
+    /// May `who` create the organisation `login`? Site administrators may create any; on a
+    /// multi-tenant server, so may any person, up to a few, in a namespace shared with accounts.
+    fn may_create_org(&self, who: &Principal, scope: Option<&TokenScope>, login: &str) -> Result<(), Status> {
+        let access = &self.hosting.access;
+        if !token_administers(scope) || !(self.is_admin(who) || access.multi_tenant) {
+            return Err(Status::permission_denied(format!(
+                "`{}` may not create organisations; add it to --platform-admins",
+                who.0
+            )));
+        }
+        if !access.multi_tenant {
+            return Ok(());
+        }
+        if RESERVED.contains(&login.to_ascii_lowercase().as_str()) || !directory::valid_login(login) {
+            return Err(Status::invalid_argument(format!("`{login}` is reserved; choose another name")));
+        }
+        if self.reg().account(login).map_err(internal)?.is_some() {
+            return Err(Status::already_exists(format!("`{login}` is taken")));
+        }
+        if self.is_admin(who) {
+            return Ok(());
+        }
+        if kind_of(&who.0) != AccountKind::Person || *who == Principal::anonymous() {
+            return Err(Status::permission_denied("only people create organisations; agents can't"));
+        }
+        // ponytail: counted before inserting, so two creates at once can pass the cap by one.
+        let max = access.max_orgs_per_account as usize;
+        let admin_of =
+            self.reg().memberships(&who.0).map_err(internal)?.iter().filter(|(_, r)| *r == Role::Admin).count();
+        if admin_of >= max {
+            return Err(Status::resource_exhausted(format!(
+                "you administer {admin_of} organisations, the most this server allows ({max})"
+            )));
+        }
+        Ok(())
+    }
+
     fn require_repo(
         &self,
         who: &Principal,
@@ -256,12 +315,6 @@ impl platform_server::Platform for Platform {
 
     async fn create_organization(&self, req: Request<CreateOrganizationRequest>) -> RpcResult<Organization> {
         let (who, scope) = caller(&req);
-        if !self.is_admin(&who) || !token_administers(scope.as_ref()) {
-            return Err(Status::permission_denied(format!(
-                "`{}` may not create organisations; add it to --platform-admins",
-                who.0
-            )));
-        }
         let r = req.into_inner();
         if !valid_part(&r.login) {
             return Err(Status::invalid_argument(format!(
@@ -269,6 +322,7 @@ impl platform_server::Platform for Platform {
                 r.login
             )));
         }
+        self.may_create_org(&who, scope.as_ref(), &r.login)?;
         let org = OrgRec {
             login: r.login,
             display_name: r.display_name,
@@ -325,7 +379,7 @@ impl platform_server::Platform for Platform {
                 r.login, r.org
             )));
         }
-        self.reg().ensure_account(&r.login, "").map_err(internal)?;
+        self.existing_account(&r.login)?;
         self.reg().set_member(&r.org, &r.login, role).map_err(internal)?;
         audit("set_member", &who, &format!("{}:{}={}", r.org, r.login, role_name(role)));
         let rec = self.reg().account(&r.login).map_err(internal)?;
@@ -522,7 +576,7 @@ impl platform_server::Platform for Platform {
         let role = role_in(r.role)?;
         if !self.reg().is_team(&r.principal).map_err(internal)? {
             directory::check_login(&r.principal)?;
-            self.reg().ensure_account(&r.principal, "").map_err(internal)?;
+            self.existing_account(&r.principal)?;
         }
         self.reg().set_grant(&rec.key, &r.principal, role).map_err(internal)?;
         audit("set_grant", &who, &format!("{}:{}={}", rec.key, r.principal, role_name(role)));
@@ -628,7 +682,10 @@ impl platform_server::Platform for Platform {
         let r = req.into_inner();
         let repo = r.repository.ok_or_else(|| Status::invalid_argument("name the repository"))?;
         let rec = self.require_repo(&who, scope.as_ref(), &repo, Role::Admin)?;
-        crate::webhooks::check_url(&r.url).map_err(Status::invalid_argument)?;
+        let url = crate::webhooks::check_url(&r.url).map_err(Status::invalid_argument)?;
+        crate::webhooks::resolve(&url, self.hosting.access.webhook_allow_private)
+            .await
+            .map_err(Status::invalid_argument)?;
         if let Some(bad) = r.events.iter().find(|e| !crate::webhooks::EVENTS.contains(&e.as_str())) {
             return Err(Status::invalid_argument(format!(
                 "`{bad}` is not an event; choose from {}",
@@ -669,7 +726,9 @@ impl platform_server::Platform for Platform {
         payload["hook"] = serde_json::json!({ "id": hook.id, "events": hook.events });
         let ids = self.reg().enqueue(&key, "ping", &payload, Some(&hook.id)).map_err(internal)?;
         let id = ids.first().ok_or_else(|| Status::internal("ping was not queued"))?;
-        let delivery = crate::webhooks::deliver_now(self.reg(), id).await.map_err(internal)?;
+        let delivery = crate::webhooks::deliver_now(self.reg(), id, self.hosting.access.webhook_allow_private)
+            .await
+            .map_err(internal)?;
         Ok(Response::new(delivery.ok_or_else(|| Status::internal("ping vanished"))?))
     }
 }

@@ -1,5 +1,5 @@
 //! One server, many repositories: created by admins, isolated from each other, each with its own
-//! storage, addressed as SERVER/OWNER/NAME; calls without a repository reach the default one.
+//! storage, addressed as SERVER/OWNER/NAME; repository calls that name none are refused.
 
 use std::sync::Arc;
 
@@ -37,7 +37,7 @@ async fn start() -> Server {
         metadata: format!("sqlite://{}/repos/{{repo}}.db", dir.path().display()),
         objects: "metadata".into(),
     };
-    let access = Arc::new(Access { open: false, admins: vec!["admin".into()] });
+    let access = Arc::new(Access { open: false, admins: vec!["admin".into()], ..Default::default() });
     let hosting = Hosting::new(templates, Arc::new(Registry::open("memory").unwrap()), build, access).unwrap();
     let default = config::open_repo("memory", "metadata").await.unwrap();
     let routes = authority_routes(default, flags, policy, checks);
@@ -137,8 +137,10 @@ async fn one_server_hosts_isolated_repositories() {
         "one repository's history is invisible from another"
     );
 
-    // Calls without a repository reach the server's default repository, which is empty.
-    assert_eq!(dev.get_ref("main").await.unwrap(), None);
+    // Repository calls that name no repository are refused, whoever makes them (the server's
+    // own `--metadata` repository is never reached unchecked).
+    let e = dev.get_ref("main").await.unwrap_err();
+    assert!(format!("{e:#}").contains("name one"), "{e:#}");
 
     // An unknown repository is a clear NotFound, not an empty repository.
     let missing = GrpcRemote::connect(&format!("{}/lumen/nope", s.url), None, Some("dev-token")).unwrap();

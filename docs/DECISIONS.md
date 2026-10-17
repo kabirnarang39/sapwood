@@ -427,3 +427,27 @@ second and p99 latency rose from 0.3 s to 2.8–3.8 s. With the cache and the pu
 within five seconds on others. Webhook lists in the console are read uncached, so delivery
 status stays current.
 
+## ADR-032: Multi-tenant mode
+
+**Decision.** One open-source switch, `pandod server --multi-tenant`, makes a platform server safe
+for strangers to share. Internal visibility means "members of the owning organisation" instead of
+"everyone with an account"; members and grants must name existing accounts; any person may create
+a few organisations (`--max-orgs-per-account`, default 3) in a namespace shared with logins, with
+service names reserved. It is one flag on the shared access rules (`Access`), read where each
+decision is made; no new types. Two fixes found while preparing it apply to every platform server,
+with or without the flag: a repository call that names no repository is refused (it used to reach
+the server's own repository with no access check), and webhooks refuse loopback, private networks
+and cloud metadata addresses unless `--webhook-allow-private` (refused with `--multi-tenant`),
+checking the address at save and delivery and connecting only to the checked address.
+
+**Why.** On a company's own server everyone is a colleague: "internal" meaning "anyone here",
+adding a login before its owner signs in, and webhooks to the internal network are features. On a
+shared server they leak one tenant's code to another, let a login be claimed in advance, and turn
+webhooks into a probe of the host's network. Keeping both behaviours behind one flag leaves
+self-hosted servers unchanged and keeps the hosted service on the open-source code.
+
+**Trade-offs.** Without invitations (next milestone), someone must sign in before they can be
+added. The organisation cap is counted before the insert, so two creations at the same moment can
+exceed it by one. A webhook host that doesn't resolve is refused when saved. Servers that relied on
+the header-less default repository, or on webhooks to private networks, must move the repository
+into the registry or start with `--webhook-allow-private`.

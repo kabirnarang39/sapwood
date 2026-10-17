@@ -43,11 +43,21 @@ pub fn required_role(path: &str) -> Role {
 }
 
 /// Access rules for a platform server.
+#[derive(Default)]
 pub struct Access {
     /// No authentication is configured (local development): every caller may do everything.
     pub open: bool,
     /// Logins that administer the whole server.
     pub admins: Vec<String>,
+    /// Strangers share this server (`--multi-tenant`, ADR-032): internal repositories are for
+    /// the owning organisation's members, organisations take existing accounts only, and any
+    /// person may create a few organisations.
+    pub multi_tenant: bool,
+    /// Organisations a person may administer when they create their own (multi-tenant only).
+    pub max_orgs_per_account: u32,
+    /// Webhooks may call loopback and private networks (`--webhook-allow-private`; never with
+    /// `multi_tenant`).
+    pub webhook_allow_private: bool,
 }
 
 impl Access {
@@ -62,8 +72,14 @@ impl Access {
         }
         let internal = |e: anyhow::Error| Status::internal(e.to_string());
         let mut role = reg.held_role(&who.0, &repo.key).map_err(internal)?;
-        // Internal and public repositories are readable by everyone with an account here.
-        if repo.visibility != Visibility::Private as i32 && who.0 != Principal::anonymous().0 {
+        // Internal and public repositories are readable by everyone with an account here; on a
+        // multi-tenant server, internal ones only by members of the owning organisation.
+        if repo.visibility != Visibility::Private as i32
+            && who.0 != Principal::anonymous().0
+            && (!self.multi_tenant
+                || repo.visibility != Visibility::Internal as i32
+                || reg.in_org(&who.0, &repo.key.owner).map_err(internal)?)
+        {
             role = role.max(Role::Read);
         }
         // An agent acts with its own roles or its owner's, whichever is higher.
@@ -299,7 +315,7 @@ mod tests {
     #[test]
     fn roles_visibility_agents_and_token_limits() {
         let reg = Registry::open("memory").unwrap();
-        let access = Access { open: false, admins: vec!["root".into()] };
+        let access = Access { open: false, admins: vec!["root".into()], ..Default::default() };
         let private = repo("lumen/fleet", Visibility::Private);
         let internal = repo("lumen/docs", Visibility::Internal);
 
@@ -330,8 +346,38 @@ mod tests {
         assert_eq!(e.code(), tonic::Code::NotFound);
 
         // Without authentication configured, everything is allowed.
-        let open = Access { open: true, admins: vec![] };
+        let open = Access { open: true, ..Default::default() };
         open.check(&reg, &Principal::anonymous(), None, &private, Role::Admin).unwrap();
+    }
+
+    #[test]
+    fn multi_tenant_internal_is_for_the_owning_organisation() {
+        let reg = Registry::open("memory").unwrap();
+        let access = Access { multi_tenant: true, ..Default::default() };
+        let internal = repo("lumen/docs", Visibility::Internal);
+        let public = repo("lumen/site", Visibility::Public);
+        reg.set_member("lumen", "kabir", Role::Read).unwrap();
+        // mira is in a team only (the registry doesn't insist on membership; the RPC does).
+        reg.set_team(&crate::directory::TeamRec {
+            org: "lumen".into(),
+            slug: "docs".into(),
+            name: "Docs".into(),
+            description: String::new(),
+            members: vec!["mira".into()],
+        })
+        .unwrap();
+        access.check(&reg, &p("kabir"), None, &internal, Role::Read).unwrap();
+        access.check(&reg, &p("mira"), None, &internal, Role::Read).unwrap();
+        let e = access.check(&reg, &p("eve"), None, &internal, Role::Read).unwrap_err();
+        assert_eq!(e.code(), tonic::Code::NotFound, "a stranger doesn't see another organisation's internal repo");
+        access.check(&reg, &p("eve"), None, &public, Role::Read).unwrap();
+        // A repository owned by someone with no organisation members is private to its grants.
+        let personal = repo("eve/notes", Visibility::Internal);
+        assert!(access.check(&reg, &p("kabir"), None, &personal, Role::Read).is_err());
+        reg.set_grant(&personal.key, "kabir", Role::Read).unwrap();
+        access.check(&reg, &p("kabir"), None, &personal, Role::Read).unwrap();
+        // Without the flag, internal stays readable by every account.
+        Access::default().check(&reg, &p("eve"), None, &internal, Role::Read).unwrap();
     }
 
     #[test]

@@ -107,6 +107,18 @@ enum Role {
         /// administrator of every organisation and repository.
         #[arg(long, env = "PANDO_PLATFORM_ADMINS", value_delimiter = ',')]
         platform_admins: Vec<String>,
+        /// Strangers share this server (a hosted service): internal repositories are for the
+        /// owning organisation only, organisations add existing accounts only, and any person
+        /// may create a few organisations.
+        #[arg(long, env = "PANDO_MULTI_TENANT", requires = "platform", conflicts_with = "webhook_allow_private", action = clap::ArgAction::SetTrue, value_parser = clap::builder::BoolishValueParser::new())]
+        multi_tenant: bool,
+        /// With --multi-tenant: how many organisations a person may administer.
+        #[arg(long, env = "PANDO_MAX_ORGS_PER_ACCOUNT", default_value_t = 3)]
+        max_orgs_per_account: u32,
+        /// Let webhooks call loopback and private networks (self-hosted CI on an internal
+        /// network). Cloud metadata addresses stay refused.
+        #[arg(long, env = "PANDO_WEBHOOK_ALLOW_PRIVATE", action = clap::ArgAction::SetTrue, value_parser = clap::builder::BoolishValueParser::new())]
+        webhook_allow_private: bool,
     },
     /// Create an access token directly in a platform registry, without a running server: how
     /// the first administrator gets in. Prints the token once.
@@ -278,6 +290,9 @@ async fn main() -> anyhow::Result<()> {
             repos_metadata,
             repos_objects,
             platform_admins,
+            multi_tenant,
+            max_orgs_per_account,
+            webhook_allow_private,
         } => {
             let repo = config::open_repo(&metadata, &objects).await?;
             let policy: Arc<dyn AccessPolicy> = match &acl {
@@ -309,9 +324,14 @@ async fn main() -> anyhow::Result<()> {
                     auth = Arc::new(NoOtherAuth);
                 }
                 anonymous = open;
+                anyhow::ensure!(
+                    !(multi_tenant && open),
+                    "--multi-tenant needs authentication: create a platform token with `pandod token` first"
+                );
                 let admins: Vec<String> =
                     platform_admins.iter().map(|a| a.trim().to_owned()).filter(|a| !a.is_empty()).collect();
-                let access = Arc::new(Access { open, admins });
+                let access =
+                    Arc::new(Access { open, admins, multi_tenant, max_orgs_per_account, webhook_allow_private });
                 let (f, p, c, reg, acc) =
                     (flags.clone(), policy.clone(), checks.clone(), registry_db.clone(), access.clone());
                 // Each repository's branches are protected by its own rules; change requests land
@@ -329,7 +349,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                 });
                 hosting = Some(Arc::new(pando_server::hosting::Hosting::new(templates, registry_db, build, access)?));
-                tracing::info!(registry = %config::redact(registry), open, "hosting many repositories");
+                tracing::info!(registry = %config::redact(registry), open, multi_tenant, "hosting many repositories");
             }
             (listen, authority_routes(repo, flags, policy, checks))
         }

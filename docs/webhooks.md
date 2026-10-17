@@ -77,6 +77,13 @@ func ok(secret, body []byte, header string) bool {
   to about 20 minutes), eight attempts in all; redirects are not followed.
 - Deliveries are queued in the registry and claimed with a lease, so several server replicas
   never send the same delivery twice, and a restart loses none.
-- Webhooks never call link-local, unspecified or multicast addresses (where cloud metadata
-  services live). Private networks are allowed, because self-hosted CI usually lives there.
+- Webhooks never call link-local, unspecified, multicast or reserved addresses, or cloud
+  metadata services (169.254.169.254, 100.100.100.200, fd00:ec2::254), including IPv4 addresses
+  written as IPv6 (mapped, NAT64, 6to4). By default they don't call loopback or private networks
+  (RFC 1918, 100.64.0.0/10, fc00::/7) either; a self-hosted server whose CI lives there starts
+  with `--webhook-allow-private`. The address is checked when the webhook is saved and again at
+  every delivery, and the delivery connects only to the address it checked, so a DNS answer that
+  changes in between can't redirect it.
+- A failed delivery reports the HTTP status, or only "unreachable": never why a connection
+  failed, so webhooks can't be used to probe the server's network.
 - Each repository may have up to 20 webhooks; the last 200 deliveries of each are kept.

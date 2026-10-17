@@ -57,8 +57,15 @@ pando token create perf-fleet --as agent/perf-05 --repo lumen/fleet --role write
   queues, so one busy repository never slows another, and a repository can be backed up, moved
   or deleted on its own.
 - Clients name a repository by adding `/OWNER/NAME` to the server address; the web console lists
-  them. A client that names none reaches the server's default repository (`--metadata`), so
-  existing setups keep working.
+  them. A repository call that names none is refused: the server's own `--metadata` repository
+  is not reachable in this mode. To keep a single-repository server's history, create the
+  repository and copy it in with `pandod copy`.
+- `--multi-tenant` (`PANDO_MULTI_TENANT=1`) is for a server that strangers share; see
+  [Multi-tenant servers](platform.md#multi-tenant-servers). `--max-orgs-per-account` (default 3)
+  caps how many organisations a person may create there.
+- Webhooks never call loopback, private networks or cloud metadata addresses.
+  `--webhook-allow-private` lets them call loopback and private networks (self-hosted CI on an
+  internal network); it can't be combined with `--multi-tenant`.
 
 ### Who may do what
 
