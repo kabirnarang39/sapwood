@@ -1,4 +1,4 @@
-//! `pando org`, `pando team`, `pando token` and `pando repo grant`: who may use a server that
+//! `pando org`, `pando team`, `pando token`, `pando repo grant` and `pando admin`: who may use a server that
 //! hosts many repositories (`pandod server --platform`).
 
 use anyhow::{Context, Result, anyhow};
@@ -6,8 +6,8 @@ use clap::{Subcommand, ValueEnum};
 use pando::remote::Ch;
 use pando_proto::platform_client::PlatformClient;
 use pando_proto::{
-    CreateOrganizationRequest, CreateTokenRequest, Empty, OrgName, RepositoryRef, RevokeTokenRequest, Role,
-    SetGrantRequest, SetMemberRequest, Team, TeamRef,
+    CreateOrganizationRequest, CreateTokenRequest, Empty, LinkIdentityRequest, OrgName, RepositoryRef,
+    RevokeTokenRequest, Role, SetGrantRequest, SetMemberRequest, SetSignupAllowRequest, Team, TeamRef,
 };
 
 fn now_ms() -> i64 {
@@ -136,6 +136,48 @@ pub enum TokenCmd {
     },
     /// Revoke a token by its id.
     Revoke { id: String },
+}
+
+#[derive(Subcommand)]
+pub enum AdminCmd {
+    /// Who may create an account by signing in (`pandod server --signup waitlist`).
+    Signup {
+        #[command(subcommand)]
+        action: SignupCmd,
+    },
+    /// Ways people sign in from a browser.
+    Identity {
+        #[command(subcommand)]
+        action: IdentityCmd,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum IdentityCmd {
+    /// Let an identity sign in as an existing account, e.g. the first administrator:
+    /// `pando admin identity link kabir --provider email --subject kabir@example.com`.
+    Link {
+        login: String,
+        /// `email`, or a sign-in provider's id such as `google`.
+        #[arg(long)]
+        provider: String,
+        /// The email address, or the provider's `sub` for the person.
+        #[arg(long)]
+        subject: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SignupCmd {
+    /// Let an email address, or everyone at `@domain`, create an account.
+    Allow {
+        entry: String,
+    },
+    /// Take an entry off the list (accounts already created stay).
+    Remove {
+        entry: String,
+    },
+    List,
 }
 
 fn explain(s: tonic::Status) -> anyhow::Error {
@@ -355,6 +397,41 @@ pub async fn webhook(mut p: PlatformClient<Ch>, cmd: WebhookCmd) -> Result<()> {
         WebhookCmd::Remove { id } => {
             p.delete_webhook(WebhookRef { id: id.clone() }).await.map_err(explain)?;
             println!("removed webhook {id}");
+        }
+    }
+    Ok(())
+}
+
+pub async fn admin(mut p: PlatformClient<Ch>, cmd: AdminCmd) -> Result<()> {
+    let action = match cmd {
+        AdminCmd::Signup { action } => action,
+        AdminCmd::Identity { action: IdentityCmd::Link { login, provider, subject } } => {
+            p.link_identity(LinkIdentityRequest {
+                login: login.clone(),
+                provider: provider.clone(),
+                subject: subject.clone(),
+            })
+            .await
+            .map_err(explain)?;
+            println!("{provider} {subject} now signs in as {login}");
+            return Ok(());
+        }
+    };
+    match action {
+        SignupCmd::Allow { entry } => {
+            p.set_signup_allow(SetSignupAllowRequest { entry: entry.clone(), allowed: true }).await.map_err(explain)?;
+            println!("{entry} may sign up");
+        }
+        SignupCmd::Remove { entry } => {
+            p.set_signup_allow(SetSignupAllowRequest { entry: entry.clone(), allowed: false })
+                .await
+                .map_err(explain)?;
+            println!("removed {entry}");
+        }
+        SignupCmd::List => {
+            for e in p.list_signup_allow(Empty {}).await.map_err(explain)?.into_inner().entries {
+                println!("{e}");
+            }
         }
     }
     Ok(())

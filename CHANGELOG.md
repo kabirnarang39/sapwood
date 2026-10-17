@@ -6,6 +6,14 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- Browser sign-in for platform servers (`pandod server --login-listen`): Google and any OpenID
+  Connect provider (`--oidc ID=ISSUER`), and single-use email links (`--smtp-url`,
+  `--mail-from`, optional Cloudflare Turnstile). A sign-in creates a 30-day platform token for
+  the console; first sign-ins create an account if `--signup` allows (default: a waitlist,
+  managed with `pando admin signup allow|remove|list`). `pando admin identity link` lets an
+  existing account, such as the first administrator, sign in from a browser (ADR-031).
+
 ### Security
 - Protected branches: a change's author can no longer approve it through an agent they mint,
   approve an agent's change they answer for, or report its required checks; such approvals don't

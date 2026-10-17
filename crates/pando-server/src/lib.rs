@@ -8,6 +8,7 @@ pub mod directory;
 pub mod features;
 pub mod hosting;
 pub mod land_hook;
+pub mod login;
 pub mod oidc;
 pub mod permissions;
 mod status;

@@ -235,6 +235,24 @@ message WebhookDelivery {
 }
 message ListWebhookDeliveriesResponse { repeated WebhookDelivery deliveries = 1; }
 
+// ---- sign-up waitlist ----
+
+message ListSignupAllowResponse { repeated string entries = 1; }
+message SetSignupAllowRequest {
+  // An email address or `@domain`.
+  string entry = 1;
+  // false removes the entry.
+  bool allowed = 2;
+}
+
+message LinkIdentityRequest {
+  string login = 1;
+  // `email`, or the id of a configured sign-in provider such as `google`.
+  string provider = 2;
+  // The email address, or the provider's `sub` for the person.
+  string subject = 3;
+}
+
 message ViewerResponse {
   Account account = 1;
   repeated Organization organizations = 2;
@@ -270,6 +288,14 @@ service Platform {
   rpc ListWebhookDeliveries(WebhookRef) returns (ListWebhookDeliveriesResponse);
   // Sends a `ping` event now.
   rpc PingWebhook(WebhookRef) returns (WebhookDelivery);
+
+  // Who may create an account by signing in when `--signup waitlist`: email addresses and
+  // `@domain` entries. Site administrators only.
+  rpc ListSignupAllow(Empty) returns (ListSignupAllowResponse);
+  rpc SetSignupAllow(SetSignupAllowRequest) returns (Empty);
+  // Lets an identity sign in as an existing account, e.g. the first administrator's email
+  // address. Site administrators only.
+  rpc LinkIdentity(LinkIdentityRequest) returns (Empty);
 }
 
 // ---- review ----

@@ -146,6 +146,7 @@ server changes them.
 | Request limits | `--request-timeout` / `PANDO_REQUEST_TIMEOUT`, `--max-in-flight` / `PANDO_MAX_IN_FLIGHT` | 600 s per call; 4,096 calls in progress, beyond which calls are refused with Unavailable so clients back off; 256 per connection |
 | Browser access | `--web-origins` / `PANDO_WEB_ORIGINS` | same-origin only; list the sites that host the web console |
 | Single sign-on | `--oidc-issuer`, `--oidc-audience`, `--oidc-claim`, `--oidc-require CLAIM=VALUE`, `--oidc-admin LOGIN` | off; works with Okta, Entra ID, Google, Auth0, Keycloak, GitHub Actions |
+| Browser sign-in (platform) | `--login-listen`, `--public-url`, `--oidc ID=ISSUER`, `--smtp-url`, `--mail-from`, `--turnstile-site-key`, `--signup` | off; see [Signing in from a browser](#signing-in-from-a-browser) |
 | Access rules | `--acl` / `PANDO_ACL` | allow everything |
 | Pre-land check | `--land-hook URL`, `--land-hook-token`, `--land-hook-timeout` | off |
 | TLS | `--tls-cert`, `--tls-key` | off |
@@ -182,6 +183,34 @@ Access rules grant read and write per directory and per branch. Principals who c
 only part of the repository get path-scoped checkouts, search and history, with changes
 outside their scope removed. The rule format and the security model are in
 [SECURITY.md](https://github.com/kabirnarang39/pando/blob/main/SECURITY.md).
+
+## Signing in from a browser
+
+On a platform server, `--login-listen ADDR` serves sign-in pages (Google or any OpenID Connect
+provider, and email links) that hand the console an ordinary platform token. Run it on a
+loopback address and route `/login/*` to it from the reverse proxy that serves the console, on
+the same host name as `--public-url`:
+
+```
+pando.example.com {
+  handle /login/* {
+    reverse_proxy 127.0.0.1:7430
+  }
+  # … the console and gRPC-Web routes
+}
+```
+
+| Setting | Flag / environment |
+|---|---|
+| Public address | `--public-url` / `PANDO_PUBLIC_URL` (https; http only for localhost) |
+| Provider | `--oidc google=https://accounts.google.com` (repeatable); `PANDO_OIDC_GOOGLE_CLIENT_ID`, `PANDO_OIDC_GOOGLE_CLIENT_SECRET` or `…_FILE` |
+| Email | `--smtp-url` / `PANDO_SMTP_URL`, `--mail-from` / `PANDO_MAIL_FROM`; `PANDO_SMTP_USERNAME`, `PANDO_SMTP_PASSWORD` or `…_FILE` |
+| Bot challenge | `--turnstile-site-key`; `PANDO_TURNSTILE_SECRET` or `…_FILE` (unset: none) |
+| Who may sign up | `--signup waitlist\|open\|closed` / `PANDO_SIGNUP` (default `waitlist`, managed with `pando admin signup`) |
+
+The proxy must set `X-Forwarded-For`, which the per-address request limits use. With sign-in
+on, the server always requires a token, even before any exists. Setup, the waitlist and
+linking the first administrator are described in [the platform notes](platform.md#sign-in).
 
 ## Pre-land checks
 

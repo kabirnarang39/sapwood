@@ -105,8 +105,9 @@ impl OidcAuthenticator {
     }
 
     /// Discover the JWKS endpoint from the issuer and keep keys fresh in the background.
+    /// Callers that authenticate API requests must run [`OidcConfig::check`] first; browser
+    /// sign-in skips it because the signup policy, not the issuer, decides who gets in.
     pub async fn discover(cfg: OidcConfig) -> anyhow::Result<Self> {
-        cfg.check()?;
         // reqwest uses rustls without a bundled provider; use ring, as the gRPC server does.
         let _ = rustls::crypto::ring::default_provider().install_default();
         let http = reqwest::Client::builder().timeout(Duration::from_secs(10)).build()?;
@@ -153,6 +154,20 @@ impl OidcAuthenticator {
 
     pub fn verify(&self, token: &str) -> Result<Principal, Status> {
         let reject = |why: &str| Status::unauthenticated(format!("invalid token: {why}"));
+        let claims = self.claims(token)?;
+        let who = claims[&self.cfg.principal_claim]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| reject(&format!("missing `{}` claim", self.cfg.principal_claim)))?;
+        if who.starts_with("agent/") || who.starts_with("bot/") || self.cfg.reserved.iter().any(|r| r == who) {
+            return Err(reject(&format!("`{who}` is reserved and can't sign in with single sign-on")));
+        }
+        Ok(Principal(who.to_owned()))
+    }
+
+    /// Every claim of a token whose signature, issuer, audience, lifetime and `require` rules check out.
+    pub fn claims(&self, token: &str) -> Result<serde_json::Value, Status> {
+        let reject = |why: &str| Status::unauthenticated(format!("invalid token: {why}"));
         let header = decode_header(token).map_err(|_| reject("malformed"))?;
         if !asymmetric(header.alg) {
             return Err(reject("symmetric algorithms are not accepted"));
@@ -186,14 +201,7 @@ impl OidcAuthenticator {
                 return Err(reject(&format!("`{claim}` is not `{want}`")));
             }
         }
-        let who = claims[&self.cfg.principal_claim]
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| reject(&format!("missing `{}` claim", self.cfg.principal_claim)))?;
-        if who.starts_with("agent/") || who.starts_with("bot/") || self.cfg.reserved.iter().any(|r| r == who) {
-            return Err(reject(&format!("`{who}` is reserved and can't sign in with single sign-on")));
-        }
-        Ok(Principal(who.to_owned()))
+        Ok(claims)
     }
 }
 

@@ -89,6 +89,64 @@ Still open, in priority order:
    read-only.
 8. **Notifications** beyond the inbox: email or webhook delivery.
 
+## Sign-in
+
+People sign in from a browser with Google (or any OpenID Connect provider) or with a link sent by
+email. `pandod server --platform … --login-listen 127.0.0.1:7430` serves the pages under
+`/login/*`; put it behind the same host name as the console (Caddy routes `/login/*` to it).
+A successful sign-in creates an ordinary platform token, "browser session" (30 days, Admin
+ceiling, every repository), and sends the browser to `{public-url}{next}#pando_session=TOKEN`.
+The console reads the token from the fragment and wipes it from the address bar. Revoking the
+token signs the browser out (ADR-031).
+
+**Google.** In Google Cloud Console, create an OAuth client of type "Web application" with the
+authorized redirect URI `{public-url}/login/oidc/google/callback`, then:
+
+```sh
+export PANDO_OIDC_GOOGLE_CLIENT_ID=….apps.googleusercontent.com
+export PANDO_OIDC_GOOGLE_CLIENT_SECRET_FILE=/run/secrets/google-client-secret
+pandod server --platform sqlite:///var/lib/pando/registry.db --repos-metadata … \
+  --login-listen 127.0.0.1:7430 --public-url https://pando.example.com \
+  --oidc google=https://accounts.google.com
+```
+
+Any other OpenID Connect provider works the same way: `--oidc ID=ISSUER_URL` with
+`PANDO_OIDC_<ID>_CLIENT_ID` and `PANDO_OIDC_<ID>_CLIENT_SECRET` (or `_FILE`), and the redirect
+URI `{public-url}/login/oidc/ID/callback`. A provider must report `email_verified: true` for
+a new account to be created; some Microsoft Entra ID setups don't send that claim, so their
+users can't sign up (link them to an account instead, below).
+
+**Email links.** `--smtp-url smtps://smtp.example.com:465` (or `smtp://HOST:587?tls=required`),
+`--mail-from "Pando <login@example.com>"`, with `PANDO_SMTP_USERNAME` and `PANDO_SMTP_PASSWORD`
+(or `_FILE`). A link works once, within 15 minutes; opening it shows a "Sign in" button, so mail
+scanners that fetch links don't use it up. The form answers the same whether or not the
+address may sign in. Add `--turnstile-site-key` and `PANDO_TURNSTILE_SECRET` to put a
+Cloudflare Turnstile challenge on it.
+
+**Who may sign up.** `--signup waitlist` (the default) lets only listed addresses and domains
+create accounts; `open` lets anyone; `closed` lets nobody. People with an account can always sign
+in. Site administrators manage the list:
+
+```sh
+pando admin signup allow mira@example.com
+pando admin signup allow @example.com
+pando admin signup list
+pando admin signup remove @example.com
+```
+
+**Accounts.** The first sign-in creates a person's account, named after the email's local part
+(`mira`, then `mira-2`… if taken by an account or organisation; site administrators' logins and
+names like `admin`, `api`, `login` and `settings` are never handed out). A sign-in is never
+attached to an existing account because the email matches. To let the first administrator
+(created with `pandod token`) sign in from a browser, a site administrator links an identity:
+
+```sh
+pando admin identity link kabir --provider email --subject kabir@example.com
+```
+
+`GET /login/providers` lists the sign-in buttons for the console:
+`{"providers":[{"id":"google","name":"Google","url":"/login/oidc/google"}],"email":true}`.
+
 ## The web app's foundation
 
 React 19 with the React Compiler, React Aria for accessible components, TanStack Router and Query,

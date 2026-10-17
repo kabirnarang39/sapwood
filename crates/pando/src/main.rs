@@ -240,6 +240,13 @@ enum Cmd {
         #[command(subcommand)]
         action: admin::TokenCmd,
     },
+    /// Server administration (site administrators only).
+    Admin {
+        #[arg(long, global = true)]
+        server: Option<String>,
+        #[command(subcommand)]
+        action: admin::AdminCmd,
+    },
     /// Move a repository from any git host to Pando: full history, and from GitHub, open pull
     /// requests (as change requests) and issues with their comments.
     Migrate {
@@ -762,6 +769,7 @@ async fn run() -> Result<()> {
         Cmd::Protect { server, action } => cr::protect(review_target(server, token)?, action).await?,
         Cmd::Webhook { server, action } => admin::webhook(platform_client(server, token)?, action).await?,
         Cmd::Token { server, action } => admin::token(platform_client(server, token)?, action).await?,
+        Cmd::Admin { server, action } => admin::admin(platform_client(server, token)?, action).await?,
         Cmd::Repo { action } => {
             let server = match &action {
                 RepoCmd::Create { server, .. } | RepoCmd::List { server, .. } | RepoCmd::Grant { server, .. } => {

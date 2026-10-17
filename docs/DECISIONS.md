@@ -451,3 +451,26 @@ one can't use required approvals. Checks aren't bound to a named reporter yet; n
 required check (`build@bot/ci`) is the next step if CI identities need pinning. Existing history
 with `.git` or `.pando` paths can't be read or checked out. Scaling a platform server out needs a
 shared registry (Postgres), which doesn't exist yet.
+
+## ADR-031: Sign-in issues platform tokens
+
+**Decision.** Browser sign-in is a separate listener inside `pandod` (`--login-listen`) that
+turns a verified identity into an ordinary platform token ("browser session", 30 days, Admin
+ceiling, every repository), handed to the console in the URL fragment. Providers are generic
+OpenID Connect (authorization code, PKCE S256, state, nonce), with Google first; email links are
+the provider-free alternative. Identities are keyed by provider and subject in `identities`,
+never by email, and a new identity is never attached to an existing account by matching email;
+a site administrator links one explicitly (`LinkIdentity`). New accounts need a verified email
+and the signup policy's consent (`--signup waitlist` by default, `signup_allow` by address or
+`@domain`). Sign-in state, nonces and email links are stored only as hashes, for one use.
+
+**Why.** Every RPC already authorises platform tokens (ADR-023), so sign-in adds no second
+session mechanism: revoking the token signs the browser out, and the token list shows browser
+sessions next to the rest. Generic OIDC covers Google, Okta, Entra and Keycloak with one
+reviewed path (ID tokens are checked by the same code as SSO bearer tokens); not depending on
+GitHub matters because Pando competes with it. A fragment never reaches servers or logs.
+
+**Trade-offs.** The console holds a bearer token in browser storage rather than an HttpOnly
+cookie, so cross-site scripting in the console could read it; a strict CSP on the console,
+the 30-day lifetime and revocation limit that. Providers that omit `email_verified` (some Entra setups)
+can't create accounts. Request limits are per process.

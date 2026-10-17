@@ -9,11 +9,12 @@ use pando_core::acl::Principal;
 use pando_proto::platform_server::{self, PlatformServer};
 use pando_proto::{
     Account, AccountKind, CreateOrganizationRequest, CreateRepositoryRequest, CreateTokenRequest, CreateTokenResponse,
-    CreateWebhookRequest, CreateWebhookResponse, Empty, Grant, ListGrantsResponse, ListMembersResponse,
-    ListOrganizationsResponse, ListRepositoriesRequest, ListRepositoriesResponse, ListTeamsResponse,
-    ListTokensResponse, ListWebhookDeliveriesResponse, ListWebhooksResponse, Member, OrgName, Organization, Repository,
-    RepositoryRef, RevokeTokenRequest, Role, SetGrantRequest, SetMemberRequest, Team, TeamRef, Token,
-    UpdateRepositoryRequest, ViewerResponse, Visibility, WebhookDelivery, WebhookRef,
+    CreateWebhookRequest, CreateWebhookResponse, Empty, Grant, LinkIdentityRequest, ListGrantsResponse,
+    ListMembersResponse, ListOrganizationsResponse, ListRepositoriesRequest, ListRepositoriesResponse,
+    ListSignupAllowResponse, ListTeamsResponse, ListTokensResponse, ListWebhookDeliveriesResponse,
+    ListWebhooksResponse, Member, OrgName, Organization, Repository, RepositoryRef, RevokeTokenRequest, Role,
+    SetGrantRequest, SetMemberRequest, SetSignupAllowRequest, Team, TeamRef, Token, UpdateRepositoryRequest,
+    ViewerResponse, Visibility, WebhookDelivery, WebhookRef,
 };
 use tonic::{Request, Response, Status};
 
@@ -87,6 +88,14 @@ fn role_in(r: i32) -> Result<Role, Status> {
 impl Platform {
     pub fn new(hosting: Arc<Hosting>) -> Self {
         Self { hosting }
+    }
+
+    fn require_site_admin(&self, who: &Principal, scope: Option<&TokenScope>) -> Result<(), Status> {
+        if self.is_admin(who) && token_administers(scope) {
+            Ok(())
+        } else {
+            Err(Status::permission_denied("only site administrators manage sign-up and sign-in"))
+        }
     }
 
     fn reg(&self) -> &Registry {
@@ -671,5 +680,49 @@ impl platform_server::Platform for Platform {
         let id = ids.first().ok_or_else(|| Status::internal("ping was not queued"))?;
         let delivery = crate::webhooks::deliver_now(self.reg(), id).await.map_err(internal)?;
         Ok(Response::new(delivery.ok_or_else(|| Status::internal("ping vanished"))?))
+    }
+
+    async fn list_signup_allow(&self, req: Request<Empty>) -> RpcResult<ListSignupAllowResponse> {
+        let (who, scope) = caller(&req);
+        self.require_site_admin(&who, scope.as_ref())?;
+        Ok(Response::new(ListSignupAllowResponse { entries: self.reg().signup_entries().map_err(internal)? }))
+    }
+
+    async fn set_signup_allow(&self, req: Request<SetSignupAllowRequest>) -> RpcResult<Empty> {
+        let (who, scope) = caller(&req);
+        self.require_site_admin(&who, scope.as_ref())?;
+        let r = req.into_inner();
+        let entry = crate::login::signup_entry(&r.entry)
+            .ok_or_else(|| Status::invalid_argument(format!("`{}` is not an email address or @domain", r.entry)))?;
+        self.reg().set_signup_entry(&entry, r.allowed).map_err(internal)?;
+        audit(if r.allowed { "signup_allow" } else { "signup_remove" }, &who, &entry);
+        Ok(Response::new(Empty {}))
+    }
+
+    async fn link_identity(&self, req: Request<LinkIdentityRequest>) -> RpcResult<Empty> {
+        let (who, scope) = caller(&req);
+        self.require_site_admin(&who, scope.as_ref())?;
+        let r = req.into_inner();
+        if self.reg().account(&r.login).map_err(internal)?.is_none() {
+            return Err(Status::not_found(format!("no account `{}` on this server", r.login)));
+        }
+        let subject = if r.provider == "email" {
+            crate::login::signup_entry(&r.subject)
+                .filter(|s| !s.starts_with('@'))
+                .ok_or_else(|| Status::invalid_argument(format!("`{}` is not an email address", r.subject)))?
+        } else {
+            r.subject.trim().to_owned()
+        };
+        if r.provider.is_empty() || subject.is_empty() {
+            return Err(Status::invalid_argument("give a provider and a subject"));
+        }
+        if !self.reg().link_identity(&r.login, &r.provider, &subject).map_err(internal)? {
+            return Err(Status::already_exists(format!(
+                "{} {subject} already signs in as another account",
+                r.provider
+            )));
+        }
+        audit("link_identity", &who, &format!("{} {subject} -> {}", r.provider, r.login));
+        Ok(Response::new(Empty {}))
     }
 }

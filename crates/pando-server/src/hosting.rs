@@ -193,6 +193,7 @@ impl Registry {
         db.execute_batch(crate::features::reviews::store::SCHEMA)?;
         db.execute_batch(crate::webhooks::SCHEMA)?;
         db.execute_batch(crate::features::issues::SCHEMA)?;
+        db.execute_batch(crate::login::SCHEMA)?;
         Ok(())
     }
 

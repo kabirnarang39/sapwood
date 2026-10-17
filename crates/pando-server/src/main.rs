@@ -78,6 +78,8 @@ struct Cli {
     tls_key: Option<std::path::PathBuf>,
 }
 
+// Parsed once at startup; boxing the big variant would buy nothing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Role {
     /// Authoritative server: all features, durable storage.
@@ -117,6 +119,34 @@ enum Role {
         /// administrator of every organisation and repository.
         #[arg(long, env = "PANDO_PLATFORM_ADMINS", value_delimiter = ',')]
         platform_admins: Vec<String>,
+        /// Serve the sign-in pages (`/login/*`: OpenID Connect providers such as Google, and
+        /// email links) on this address, behind the same host name as the console.
+        #[arg(long, env = "PANDO_LOGIN_LISTEN", requires_all = ["platform", "public_url"])]
+        login_listen: Option<SocketAddr>,
+        /// Where people reach this server, e.g. https://pando.example.com: the base of sign-in
+        /// redirect addresses and email links.
+        #[arg(long, env = "PANDO_PUBLIC_URL")]
+        public_url: Option<String>,
+        /// A sign-in provider, ID=ISSUER_URL (repeatable), e.g. google=https://accounts.google.com.
+        /// Its client comes from PANDO_OIDC_<ID>_CLIENT_ID and PANDO_OIDC_<ID>_CLIENT_SECRET (or
+        /// _FILE variants).
+        #[arg(long = "oidc", value_name = "ID=ISSUER_URL")]
+        oidc_providers: Vec<String>,
+        /// Mail server for sign-in links: smtps://HOST:465 or smtp://HOST:587?tls=required.
+        /// Credentials from PANDO_SMTP_USERNAME and PANDO_SMTP_PASSWORD (or _FILE variants).
+        #[arg(long, env = "PANDO_SMTP_URL", hide_env_values = true)]
+        smtp_url: Option<String>,
+        /// Sender of sign-in links, e.g. "Pando <login@example.com>".
+        #[arg(long, env = "PANDO_MAIL_FROM")]
+        mail_from: Option<String>,
+        /// Cloudflare Turnstile site key for the email form; its secret comes from
+        /// PANDO_TURNSTILE_SECRET (or _FILE). Unset: no challenge.
+        #[arg(long, env = "PANDO_TURNSTILE_SITE_KEY")]
+        turnstile_site_key: Option<String>,
+        /// Who may create an account by signing in: waitlist (`pando admin signup allow`),
+        /// open, or closed. Existing accounts can always sign in.
+        #[arg(long, env = "PANDO_SIGNUP", value_enum, default_value = "waitlist")]
+        signup: pando_server::login::Signup,
     },
     /// Create an access token directly in a platform registry, without a running server: how
     /// the first administrator gets in. Prints the token once.
@@ -298,6 +328,7 @@ async fn main() -> anyhow::Result<()> {
                     .filter(|a| !a.is_empty() && !cli.oidc_admins.iter().any(|o| o.trim() == a))
                     .collect(),
             };
+            cfg.check()?;
             authenticators.push(Arc::new(OidcAuthenticator::discover(cfg).await?));
             tracing::info!(%issuer, "OIDC authentication enabled");
         } else {
@@ -329,6 +360,13 @@ async fn main() -> anyhow::Result<()> {
             repos_metadata,
             repos_objects,
             platform_admins,
+            login_listen,
+            public_url,
+            oidc_providers,
+            smtp_url,
+            mail_from,
+            turnstile_site_key,
+            signup,
         } => {
             let repo = config::open_repo(&metadata, &objects).await?;
             let policy: Arc<dyn AccessPolicy> = match &acl {
@@ -355,13 +393,37 @@ async fn main() -> anyhow::Result<()> {
                 // Platform tokens count as authentication: once one exists, every call needs one
                 // (or a static token or single sign-on). With none of them, the server is open,
                 // for local development.
-                let open = anonymous && !registry_db.has_tokens()?;
+                // With sign-in on, strangers can get accounts: the server is never open.
+                let open = anonymous && !registry_db.has_tokens()? && login_listen.is_none();
                 if anonymous && !open {
                     auth = Arc::new(NoOtherAuth);
                 }
                 anonymous = open;
                 let admins: Vec<String> =
                     platform_admins.iter().map(|a| a.trim().to_owned()).filter(|a| !a.is_empty()).collect();
+                if let Some(addr) = login_listen {
+                    let settings = pando_server::login::Settings {
+                        public_url: public_url.clone().unwrap_or_default(),
+                        oidc: oidc_providers.clone(),
+                        smtp_url: smtp_url.clone(),
+                        mail_from: mail_from.clone(),
+                        turnstile_site_key: turnstile_site_key.clone(),
+                        signup,
+                        reserved: admins.clone(),
+                    };
+                    let login = pando_server::login::Login::new(
+                        settings,
+                        registry_db.clone(),
+                        &pando_server::login::env_secret,
+                    )?;
+                    let listener = tokio::net::TcpListener::bind(addr).await?;
+                    tracing::info!(%addr, ?signup, "sign-in pages");
+                    tokio::spawn(async move {
+                        if let Err(e) = pando_server::login::serve(listener, Arc::new(login)).await {
+                            tracing::error!(error = %e, "sign-in pages stopped");
+                        }
+                    });
+                }
                 let access = Arc::new(Access { open, admins });
                 let (f, p, c, reg, acc) =
                     (flags.clone(), policy.clone(), checks.clone(), registry_db.clone(), access.clone());
