@@ -20,12 +20,20 @@ pub struct Server {
 }
 
 pub async fn start() -> Server {
+    // Webhook tests call a receiver on loopback, as self-hosted CI on a private network would.
+    start_with(Access { open: false, admins: vec!["admin".into()], webhook_allow_private: true, ..Default::default() })
+        .await
+}
+
+/// A server with these access rules.
+#[allow(dead_code)]
+pub async fn start_with(access: Access) -> Server {
     let dir = tempfile::tempdir().unwrap();
     let flags = Arc::new(SpecFlags::all_on());
     let policy: Arc<dyn AccessPolicy> = Arc::new(AllowAllPolicy);
     let checks = Arc::new(NoChecks);
     let registry = Arc::new(Registry::open("memory").unwrap());
-    let access = Arc::new(Access { open: false, admins: vec!["admin".into()] });
+    let access = Arc::new(access);
     let (reg, acc) = (registry.clone(), access.clone());
     let build: BuildRoutes = Arc::new(move |key, repo| {
         let protected: Arc<dyn AccessPolicy> = Arc::new(ProtectedRefs {

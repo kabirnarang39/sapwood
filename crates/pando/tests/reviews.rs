@@ -318,7 +318,7 @@ async fn webhooks_deliver_signed_events() {
             ..Default::default()
         })
         .await;
-    assert!(bad.is_ok(), "link-local is refused when delivering, not when saving");
+    assert_eq!(bad.unwrap_err().code(), Code::InvalidArgument, "cloud metadata is never a webhook target");
 
     // A ping arrives at once, signed.
     let ping =

@@ -1,7 +1,7 @@
 import { useNavigate } from "@tanstack/react-router";
 import { useState } from "react";
 import { Checkbox, FieldError, Form, Input, Label, Text, TextField } from "react-aria-components";
-import { explain, makeApi, serverTransport } from "../api/client";
+import { explain, isUnimplemented, makeApi, serverTransport } from "../api/client";
 import { pendingServer, useConnection } from "../connection";
 import { Icon } from "../ui";
 
@@ -21,6 +21,15 @@ export function ConnectView() {
   const test = async () => {
     const api = makeApi(serverTransport(url, token || null));
     const who = await api.access.whoAmI({});
+    // A server that hosts many repositories answers for them by name, not for a default one.
+    const viewer = await api.platform.viewer({}).catch((e) => {
+      if (isUnimplemented(e)) return null;
+      throw e;
+    });
+    if (viewer) {
+      const n = viewer.organizations.length;
+      return `Connected as ${who.principal}. ${n} ${n === 1 ? "organisation" : "organisations"}.`;
+    }
     const refs = await api.refs.list({});
     return `Connected as ${who.principal}. ${refs.refs.length} ${refs.refs.length === 1 ? "branch" : "branches"}; ${who.fullRead ? "full read access" : `may read ${who.readPrefixes.join(", ") || "nothing"}`}.`;
   };

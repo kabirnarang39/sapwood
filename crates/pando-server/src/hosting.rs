@@ -432,8 +432,9 @@ pub fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
-/// Routes calls that name a repository to that repository's services; everything else goes to
-/// the default repository. Without hosting the header is ignored (one-repository servers).
+/// Routes calls that name a repository to that repository's services, once the caller may make
+/// them. With hosting, a repository call that names none is refused; without hosting the header
+/// is ignored (one-repository servers).
 #[derive(Clone)]
 pub struct HostingLayer(pub Option<Arc<Hosting>>);
 
@@ -470,36 +471,51 @@ where
         let path = req.uri().path();
         let central =
             ["/pando.v1.Platform/", "/pando.v1.Reviews/", "/pando.v1.Issues/"].iter().any(|p| path.starts_with(p));
-        let named =
-            req.headers().get(REPO_HEADER).and_then(|v| v.to_str().ok()).filter(|_| !central).map(str::to_owned);
-        match (self.hosting.clone(), named) {
-            (Some(hosting), Some(name)) => Box::pin(async move {
-                let who = req
-                    .extensions()
-                    .get::<pando_core::acl::Principal>()
-                    .cloned()
-                    .unwrap_or_else(pando_core::acl::Principal::anonymous);
-                let scope = req.extensions().get::<crate::auth::TokenScope>().cloned();
-                let need = crate::permissions::required_role(req.uri().path());
-                let routes = match RepoKey::parse(&name)
-                    .and_then(|key| hosting.authorize(&key, &who, scope.as_ref(), need).map(|_| key))
-                {
-                    Ok(key) => hosting.routes(&key).await,
-                    Err(e) => Err(e),
-                };
-                match routes {
-                    Ok(routes) => match routes.oneshot(req).await {
-                        Ok(resp) => Ok(resp),
-                        Err(never) => match never {},
-                    },
-                    Err(status) => Ok(status.into_http()),
-                }
-            }),
-            _ => {
-                let fut = self.inner.call(req);
-                Box::pin(fut)
+        let Some(hosting) = self.hosting.clone().filter(|_| !central) else {
+            return Box::pin(self.inner.call(req));
+        };
+        let named = req.headers().get(REPO_HEADER).map(|v| v.to_str().map(str::to_owned));
+        let name = match named {
+            Some(Ok(name)) => name,
+            Some(Err(_)) => {
+                return Box::pin(async {
+                    Ok(Status::invalid_argument("`x-pando-repo` is not OWNER/NAME").into_http())
+                });
             }
-        }
+            // Calls that touch no repository; every other call on a server that hosts many must
+            // name one, so the server's own repository is never reached unchecked.
+            None if path.starts_with("/grpc.") || path == "/pando.v1.Access/WhoAmI" => {
+                return Box::pin(self.inner.call(req));
+            }
+            None => {
+                return Box::pin(async {
+                    Ok(Status::not_found("this server hosts many repositories: name one (a URL ending in /OWNER/NAME)")
+                        .into_http())
+                });
+            }
+        };
+        Box::pin(async move {
+            let who = req
+                .extensions()
+                .get::<pando_core::acl::Principal>()
+                .cloned()
+                .unwrap_or_else(pando_core::acl::Principal::anonymous);
+            let scope = req.extensions().get::<crate::auth::TokenScope>().cloned();
+            let need = crate::permissions::required_role(req.uri().path());
+            let routes = match RepoKey::parse(&name)
+                .and_then(|key| hosting.authorize(&key, &who, scope.as_ref(), need).map(|_| key))
+            {
+                Ok(key) => hosting.routes(&key).await,
+                Err(e) => Err(e),
+            };
+            match routes {
+                Ok(routes) => match routes.oneshot(req).await {
+                    Ok(resp) => Ok(resp),
+                    Err(never) => match never {},
+                },
+                Err(status) => Ok(status.into_http()),
+            }
+        })
     }
 }
 

@@ -2,7 +2,7 @@
 //! trackers can react. Events go into a delivery queue in the registry and a worker posts them,
 //! signed like GitHub's (`X-Pando-Signature-256: sha256=HMAC`), retrying with backoff.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -78,18 +78,65 @@ pub fn check_url(url: &str) -> Result<reqwest::Url, String> {
     Ok(u)
 }
 
-/// Addresses a webhook never calls: link-local (cloud metadata services live there),
-/// unspecified and multicast. Private networks are allowed: self-hosted CI usually lives there.
-fn forbidden(ip: IpAddr) -> bool {
+/// Addresses a webhook may not call. Never: link-local (cloud metadata services live there, as
+/// do 100.100.100.200 and fd00:ec2::254), unspecified, multicast, broadcast and reserved ranges.
+/// Unless `allow_private` (`--webhook-allow-private`, for self-hosted CI on an internal network):
+/// loopback, private networks (RFC 1918, CGNAT, IPv6 unique-local) and other special ranges.
+/// IPv4 addresses embedded in IPv6 (mapped, compatible, NAT64, 6to4) are judged as IPv4.
+fn forbidden(ip: IpAddr, allow_private: bool) -> bool {
     match ip {
-        IpAddr::V4(v4) => v4.is_link_local() || v4.is_unspecified() || v4.is_multicast() || v4.is_broadcast(),
+        IpAddr::V4(v4) => {
+            let [a, b, c, _] = v4.octets();
+            let never = v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_multicast()
+                || a == 0
+                || a >= 240
+                || v4 == Ipv4Addr::new(100, 100, 100, 200);
+            let private = v4.is_loopback()
+                || v4.is_private()
+                || (a == 100 && (b & 0xc0) == 64)
+                || (a, b, c) == (192, 0, 0)
+                || (a == 198 && (b & 0xfe) == 18);
+            never || (private && !allow_private)
+        }
+        IpAddr::V6(v6) if v6.is_loopback() => !allow_private,
         IpAddr::V6(v6) => {
-            (v6.segments()[0] & 0xffc0) == 0xfe80
+            let s = v6.segments();
+            let v4 = |hi: u16, lo: u16| Ipv4Addr::from(((hi as u32) << 16) | lo as u32);
+            let embedded = v6
+                .to_ipv4()
+                .or_else(|| (s[..6] == [0x64, 0xff9b, 0, 0, 0, 0]).then(|| v4(s[6], s[7])))
+                .or_else(|| (s[0] == 0x2002).then(|| v4(s[1], s[2])));
+            if let Some(v4) = embedded {
+                return forbidden(IpAddr::V4(v4), allow_private);
+            }
+            let never = (s[0] & 0xffc0) == 0xfe80
                 || v6.is_unspecified()
                 || v6.is_multicast()
-                || v6.to_ipv4_mapped().is_some_and(|v4| forbidden(IpAddr::V4(v4)))
+                || v6 == Ipv6Addr::new(0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x254)
+                // Local-use NAT64 (RFC 8215): translates to anything.
+                || s[..3] == [0x64, 0xff9b, 1];
+            let private = (s[0] & 0xfe00) == 0xfc00;
+            never || (private && !allow_private)
         }
     }
+}
+
+/// The addresses a webhook URL may be called at: every address its host resolves to must be
+/// allowed. Deliveries connect only to these, so a second DNS answer can't swap them.
+pub async fn resolve(u: &reqwest::Url, allow_private: bool) -> Result<Vec<SocketAddr>, String> {
+    let host = u.host_str().unwrap_or_default().trim_matches(['[', ']']);
+    let port = u.port_or_known_default().unwrap_or(443);
+    let found = tokio::time::timeout(Duration::from_secs(5), tokio::net::lookup_host((host, port))).await;
+    let addrs: Vec<SocketAddr> = match found {
+        Ok(Ok(addrs)) => addrs.collect(),
+        _ => return Err(format!("can't resolve {host}")),
+    };
+    if addrs.is_empty() || addrs.iter().any(|a| forbidden(a.ip(), allow_private)) {
+        return Err(format!("{host} is an address webhooks may not call from this server"));
+    }
+    Ok(addrs)
 }
 
 fn hook_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<(Webhook, String)> {
@@ -307,22 +354,28 @@ pub fn emit(reg: &Registry, key: &RepoKey, event: &str, payload: Value) {
     }
 }
 
-/// Posts one delivery. Returns the HTTP status (or -1) and an error message.
-async fn post(client: &reqwest::Client, url: &str, secret: &str, event: &str, id: &str, body: String) -> (i32, String) {
+/// Posts one delivery. Returns the HTTP status (or -1) and an error message. The message never
+/// says why a connection failed, so a webhook can't be used to probe the server's network.
+async fn post(url: &str, secret: &str, event: &str, id: &str, body: String, allow_private: bool) -> (i32, String) {
     let Ok(u) = check_url(url) else { return (-1, "not a valid URL".into()) };
-    let host = u.host_str().unwrap_or_default().trim_matches(['[', ']']).to_owned();
-    let port = u.port_or_known_default().unwrap_or(443);
-    // ponytail: checked at resolve time, not at connect time (a DNS answer could change in
-    // between); pin the resolved address in the client if that ever matters.
-    match tokio::net::lookup_host((host.as_str(), port)).await {
-        Ok(addrs) => {
-            let addrs: Vec<_> = addrs.collect();
-            if addrs.is_empty() || addrs.iter().any(|a| forbidden(a.ip())) {
-                return (-1, format!("{host} resolves to an address webhooks may not call"));
-            }
+    let addrs = match resolve(&u, allow_private).await {
+        Ok(a) => a,
+        Err(e) => return (-1, e),
+    };
+    // A client per delivery, pinned to the vetted addresses (deliveries are few).
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .resolve_to_addrs(u.host_str().unwrap_or_default(), &addrs)
+        .build();
+    let client = match client {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "building the webhook client");
+            return (-1, "unreachable".into());
         }
-        Err(e) => return (-1, format!("resolving {host}: {e}")),
-    }
+    };
     let sent = client
         .post(u)
         .header("content-type", "application/json")
@@ -336,20 +389,15 @@ async fn post(client: &reqwest::Client, url: &str, secret: &str, event: &str, id
     match sent {
         Ok(r) if r.status().is_success() => (r.status().as_u16() as i32, String::new()),
         Ok(r) => (r.status().as_u16() as i32, format!("answered {}", r.status())),
-        Err(e) => (-1, e.to_string()),
+        Err(e) => {
+            tracing::info!(delivery = %id, error = %e, "webhook unreachable");
+            (-1, "unreachable".into())
+        }
     }
 }
 
-fn client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .expect("an HTTP client")
-}
-
 /// Delivers one queued delivery now (used by ping); returns how it went.
-pub async fn deliver_now(reg: &Registry, id: &str) -> anyhow::Result<Option<WebhookDelivery>> {
+pub async fn deliver_now(reg: &Registry, id: &str, allow_private: bool) -> anyhow::Result<Option<WebhookDelivery>> {
     let due = {
         let db = reg.db.lock().unwrap();
         db.query_row(
@@ -360,15 +408,14 @@ pub async fn deliver_now(reg: &Registry, id: &str) -> anyhow::Result<Option<Webh
         .ok()
     };
     if let Some((url, secret, event, payload, attempts)) = due {
-        let (status, error) = post(&client(), &url, &secret, &event, id, payload).await;
+        let (status, error) = post(&url, &secret, &event, id, payload, allow_private).await;
         reg.record_attempt(id, attempts + 1, status, &error, (200..300).contains(&status))?;
     }
     reg.delivery(id)
 }
 
 /// Posts due deliveries until the server stops.
-pub async fn run(reg: Arc<Registry>) {
-    let client = client();
+pub async fn run(reg: Arc<Registry>, allow_private: bool) {
     loop {
         let due = match reg.claim_due(32) {
             Ok(d) => d,
@@ -382,9 +429,9 @@ pub async fn run(reg: Arc<Registry>) {
             continue;
         }
         let posts = due.into_iter().map(|Due { id, url, secret, event, payload, attempts }| {
-            let (reg, client) = (reg.clone(), client.clone());
+            let reg = reg.clone();
             async move {
-                let (status, error) = post(&client, &url, &secret, &event, &id, payload).await;
+                let (status, error) = post(&url, &secret, &event, &id, payload, allow_private).await;
                 let ok = (200..300).contains(&status);
                 if !ok {
                     tracing::info!(delivery = %id, status, error, attempt = attempts + 1, "webhook delivery failed");
@@ -457,16 +504,71 @@ mod tests {
     #[test]
     fn urls_and_addresses() {
         assert!(check_url("https://ci.example.com/hooks/pando").is_ok());
-        assert!(check_url("http://10.0.0.5:8080/hook").is_ok(), "private networks are allowed");
-        for bad in ["ftp://x", "https://", "not a url", "https://user:pw@example.com/"] {
+        assert!(check_url("http://10.0.0.5:8080/hook").is_ok(), "addresses are judged when resolved");
+        for bad in ["ftp://x", "file:///etc/passwd", "https://", "not a url", "https://user:pw@example.com/"] {
             assert!(check_url(bad).is_err(), "{bad}");
         }
-        for ip in ["169.254.169.254", "0.0.0.0", "224.0.0.1", "fe80::1", "::ffff:169.254.169.254"] {
-            assert!(forbidden(ip.parse().unwrap()), "{ip}");
+        let never = [
+            "169.254.169.254",
+            "100.100.100.200",
+            "0.0.0.0",
+            "0.1.2.3",
+            "224.0.0.1",
+            "240.0.0.1",
+            "255.255.255.255",
+            "fe80::1",
+            "::",
+            "fd00:ec2::254",
+            "::ffff:169.254.169.254",
+            "64:ff9b::a9fe:a9fe",
+            "64:ff9b:1::1",
+            "2002:a9fe:a9fe::1",
+        ];
+        let private = [
+            "127.0.0.1",
+            "10.0.0.1",
+            "172.16.0.1",
+            "192.168.1.1",
+            "100.64.0.1",
+            "192.0.0.8",
+            "198.18.0.1",
+            "::1",
+            "fd12::1",
+            "::ffff:127.0.0.1",
+            "::127.0.0.1",
+            "64:ff9b::a00:1",
+        ];
+        for ip in never {
+            assert!(forbidden(ip.parse().unwrap(), false), "{ip}");
+            assert!(forbidden(ip.parse().unwrap(), true), "{ip} even with --webhook-allow-private");
         }
-        for ip in ["10.0.0.5", "127.0.0.1", "93.184.216.34", "::1"] {
-            assert!(!forbidden(ip.parse().unwrap()), "{ip}");
+        for ip in private {
+            assert!(forbidden(ip.parse().unwrap(), false), "{ip}");
+            assert!(!forbidden(ip.parse().unwrap(), true), "{ip} with --webhook-allow-private");
         }
+        for ip in ["93.184.216.34", "2606:2800:220:1::1", "64:ff9b::5db8:d822"] {
+            assert!(!forbidden(ip.parse().unwrap(), false), "{ip}");
+        }
+    }
+
+    /// A name that resolves to loopback is refused at delivery as well as when saved, and the
+    /// failure says nothing about the target's network.
+    #[tokio::test]
+    async fn deliveries_refuse_names_that_resolve_to_private_addresses() {
+        let u = check_url("http://localhost:7420/hook").unwrap();
+        assert!(resolve(&u, false).await.is_err());
+        assert!(resolve(&u, true).await.is_ok());
+        let reg = Registry::open("memory").unwrap();
+        let key = RepoKey::parse("lumen/fleet").unwrap();
+        let (hook, _) = reg.create_webhook(&key, "http://localhost:7420/hook", &[], "", "kabir").unwrap();
+        let id = reg.enqueue(&key, "ping", &json!({}), Some(&hook.id)).unwrap().remove(0);
+        let d = deliver_now(&reg, &id, false).await.unwrap().unwrap();
+        assert!(!d.delivered && d.status == -1 && d.error.contains("may not call"), "{d:?}");
+        // Allowed but closed: the error is only "unreachable".
+        let (closed, _) = reg.create_webhook(&key, "http://127.0.0.1:9/", &[], "", "kabir").unwrap();
+        let id = reg.enqueue(&key, "ping", &json!({}), Some(&closed.id)).unwrap().remove(0);
+        let d = deliver_now(&reg, &id, true).await.unwrap().unwrap();
+        assert_eq!((d.status, d.error.as_str()), (-1, "unreachable"));
     }
 
     #[test]

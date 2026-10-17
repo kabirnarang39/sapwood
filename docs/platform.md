@@ -48,8 +48,8 @@ Each phase ships behind a feature flag, with server and web app together, tests,
 demo that runs in the browser.
 
 1. **Repositories and organisations** (done in 3.1). One server hosts many repositories, each with its own
-   storage (a `{repo}` template in the storage URLs). Requests name their repository; an older
-   client that names none reaches the default repository. Organisation and repository pages,
+   storage (a `{repo}` template in the storage URLs). Requests name their repository; a
+   repository call that names none is refused. Organisation and repository pages,
    repository creation, a home page with your repositories and their activity.
 2. **Coexistence with GitHub, GitLab and Bitbucket** (done in 3.1: `pando mirror`). A continuous mirror of every landed change
    to an existing host, so CI, integrations and audit archives keep working while agents land in
@@ -66,6 +66,27 @@ demo that runs in the browser.
    webhooks, and an audit view.
 6. **Issues and releases** *(documented flows)*. Issues with the same live lists, labels and
    linking to change requests; releases with notes and assets.
+
+## Multi-tenant servers
+
+A server that strangers share (a hosted service) starts with `--multi-tenant`
+(`PANDO_MULTI_TENANT=1`, with `--platform`; ADR-032). It is off by default, and a company's own
+server behaves as before. With it:
+
+- **Internal** repositories are readable by members of the owning organisation (directly or
+  through a team), not by every account on the server. Public repositories stay readable by
+  every account; private ones only by those given access.
+- **Members and grants** name people who already have an account (they have signed in once).
+  Anyone else is refused with "LOGIN has no Pando account yet; ask them to sign in first, or
+  send an invitation". Agents (`agent/NAME`) are recorded as before.
+- **Organisations** may be created by any person (not agents), who becomes their administrator,
+  up to `--max-orgs-per-account` (default 3) organisations they administer. Organisations and
+  accounts share one namespace: a name that is someone's login is taken, and service names
+  (`admin`, `api`, `login`, `settings`, `new`, `explore`, `www`, `mail`, `support`, `help`,
+  `security`, `status`, `docs`, `pando`) are reserved. Site administrators are not capped.
+- **Webhooks** keep the default refusal of loopback and private networks;
+  `--webhook-allow-private` can't be combined with it.
+- The server refuses to start without authentication.
 
 ## UX audit of the web app (2026-10-17)
 

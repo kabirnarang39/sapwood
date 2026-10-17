@@ -147,7 +147,7 @@ pub async fn serve(
         None => auth,
     };
     if let Some(h) = &hosting {
-        tokio::spawn(webhooks::run(h.registry.clone()));
+        tokio::spawn(webhooks::run(h.registry.clone(), h.access.webhook_allow_private));
         routes = routes
             .add_service(features::platform::service(features::platform::Platform::new(h.clone())))
             .add_service(features::reviews::service(features::reviews::Reviews::new(h.clone())))

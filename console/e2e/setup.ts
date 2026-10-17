@@ -62,7 +62,7 @@ export default async function setup() {
 
   const hosting = spawn(
     join(bin, "pandod"),
-    ["server", "--listen", `127.0.0.1:${HOSTING_PORT}`, "--metadata", "memory", "--platform", `sqlite://${join(dir, "platform.db")}`, "--repos-metadata", `sqlite://${join(dir, "repos")}/{repo}.db`, "--platform-admins", "anonymous", "--web-origins", "http://127.0.0.1:4173"],
+    ["server", "--listen", `127.0.0.1:${HOSTING_PORT}`, "--metadata", "memory", "--platform", `sqlite://${join(dir, "platform.db")}`, "--repos-metadata", `sqlite://${join(dir, "repos")}/{repo}.db`, "--platform-admins", "anonymous", "--webhook-allow-private", "--web-origins", "http://127.0.0.1:4173"],
     { stdio: ["ignore", "ignore", "inherit"] },
   );
   try {

@@ -200,7 +200,14 @@ impl Registry {
     // ---- organisations, members, teams ----
 
     pub fn organization(&self, login: &str) -> anyhow::Result<Option<OrgRec>> {
-        Ok(self.organizations()?.into_iter().find(|o| o.login == login))
+        let db = self.db.lock().unwrap();
+        let mut st = db.prepare_cached(
+            "SELECT login, display_name, description, created_at_ms FROM organizations WHERE login = ?1",
+        )?;
+        let mut rows = st.query_map([login], |r| {
+            Ok(OrgRec { login: r.get(0)?, display_name: r.get(1)?, description: r.get(2)?, created_at_ms: r.get(3)? })
+        })?;
+        Ok(rows.next().transpose()?)
     }
 
     pub fn organizations(&self) -> anyhow::Result<Vec<OrgRec>> {
@@ -250,6 +257,19 @@ impl Registry {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Whether `login` belongs to `org`, directly or through one of its teams.
+    pub fn in_org(&self, login: &str, org: &str) -> anyhow::Result<bool> {
+        self.cached(format!("org:{login}:{org}"), || {
+            let db = self.db.lock().unwrap();
+            Ok(db.query_row(
+                "SELECT EXISTS (SELECT 1 FROM members WHERE org = ?1 AND login = ?2)
+                     OR EXISTS (SELECT 1 FROM team_members WHERE org = ?1 AND login = ?2)",
+                (org, login),
+                |r| r.get(0),
+            )?)
+        })
     }
 
     /// Organisations `login` belongs to, with its role in each.
